@@ -139,17 +139,15 @@ def city_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
-def zone_keyboard(zones: list[str], city: str) -> InlineKeyboardMarkup:
-    """Build a keyboard with one button per zone plus an "all zones" option.
+def zone_keyboard(zones: list[str]) -> InlineKeyboardMarkup:
+    """Build a keyboard with one button per zone.
 
     Callback data uses indices to stay well within Telegram's 64-byte limit.
     """
-    buttons = [
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton(zone, callback_data=f"zone:{i}")]
         for i, zone in enumerate(zones)
-    ]
-    buttons.append([InlineKeyboardButton(f"כל {city} / All of {city}", callback_data="zone:all")])
-    return InlineKeyboardMarkup(buttons)
+    ])
 
 
 async def fetch_city_zones(city: str) -> list[str]:
@@ -221,10 +219,9 @@ async def handle_city_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if zones:
         # Store zone list in chat_data so handle_zone_callback can look them up.
         context.chat_data["pending_zones"] = zones
-        context.chat_data["pending_city"] = city
         await query.edit_message_text(
             f"בחר אזור ב-{city}:\nChoose a zone in {city}:",
-            reply_markup=zone_keyboard(zones, city),
+            reply_markup=zone_keyboard(zones),
         )
     else:
         # No sub-zones found — register for the whole city.
@@ -242,24 +239,17 @@ async def handle_zone_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
 
     chat_id = str(query.message.chat_id)
-    data = query.data  # "zone:<index>" or "zone:all"
-
-    city = context.chat_data.get("pending_city", "")
     zones: list[str] = context.chat_data.get("pending_zones", [])
 
-    if data == "zone:all":
-        location = city
-    else:
-        try:
-            idx = int(data.removeprefix("zone:"))
-            location = zones[idx]
-        except (ValueError, IndexError):
-            await query.edit_message_text("שגיאה — נסה שוב / Error — please try again.")
-            return
+    try:
+        idx = int(query.data.removeprefix("zone:"))
+        location = zones[idx]
+    except (ValueError, IndexError):
+        await query.edit_message_text("שגיאה — נסה שוב / Error — please try again.")
+        return
 
     register_user(chat_id, location)
     context.chat_data.pop("pending_zones", None)
-    context.chat_data.pop("pending_city", None)
 
     await query.edit_message_text(
         f"✅ נרשמת לקבלת התרעות עבור: {location}\n"

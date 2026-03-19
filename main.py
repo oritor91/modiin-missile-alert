@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import sys
+import unicodedata
 from pathlib import Path
 
 import aiohttp
@@ -193,11 +194,25 @@ async def fetch_alerts(session: aiohttp.ClientSession) -> dict | None:
         return None
 
 
+def normalize(text: str) -> str:
+    """NFC-normalize and strip so city comparisons are encoding-agnostic."""
+    return unicodedata.normalize("NFC", text).strip()
+
+
 def get_alerted_cities(alert_data: dict) -> set[str]:
-    """Return the set of targeted cities for missile/rocket alerts (cat=1)."""
-    if str(alert_data.get("cat", "")) != "1":
-        return set()
-    return {city.strip() for city in alert_data.get("data", []) if city.strip()}
+    """Return the set of targeted cities from active alerts.
+
+    cat=1 is missile/rocket fire.  We now forward *all* categories so that
+    no real alert is silently dropped; the category is logged so it can be
+    investigated if unexpected values appear.
+    """
+    cat = str(alert_data.get("cat", ""))
+    if cat != "1":
+        logger.info("Alert with cat=%s (non-missile): %s", cat, alert_data.get("title", ""))
+    cities = {normalize(city) for city in alert_data.get("data", []) if city.strip()}
+    if cities:
+        logger.info("Active alert cat=%s, cities=%s", cat, cities)
+    return cities
 
 
 def format_alert_message(city: str, alert_data: dict) -> str:
@@ -243,8 +258,11 @@ async def poll_loop(application: Application) -> None:
                     continue
 
                 users = load_users()
+                if not users:
+                    logger.warning("Alert fired but no users are registered.")
                 for chat_id, city in users.items():
-                    if city not in alerted_cities:
+                    if normalize(city) not in alerted_cities:
+                        logger.debug("User %s city '%s' not in alerted cities %s", chat_id, city, alerted_cities)
                         continue
                     if _sent_alerts.get(chat_id) == alert_id:
                         continue  # already sent this alert to this user

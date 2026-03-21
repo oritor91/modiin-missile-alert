@@ -2,9 +2,10 @@
 Missile alert Telegram bot.
 
 Polls the oref.org.il REST API for active rocket/missile alerts and notifies
-registered users when their chosen city is targeted.
+registered users when their chosen area is targeted.
 
-Users register via /start or /city and pick a city from an inline keyboard.
+Users register via /start or /city: first pick a city group, then pick the
+specific area within that city (matching the exact strings the oref API uses).
 """
 
 import asyncio
@@ -46,15 +47,40 @@ OREF_HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
 }
 
-# Preset cities shown on the inline keyboard
-PRESET_CITIES = [
-    "מודיעין-מכבים-רעות",
-    "תל אביב - יפו",
-    "ירושלים",
-    "חיפה",
-    "באר שבע",
-    "ראשון לציון",
-]
+# Two-level city → area mapping.
+# Keys are displayed on the first keyboard; values are the exact area strings
+# that oref.org.il uses in its alert payload. Cities with a single entry skip
+# the second keyboard and register directly.
+CITY_AREAS: dict[str, list[str]] = {
+    "מודיעין": [
+        "מודיעין מכבים רעות",
+        "מודיעין - ישפרו סנטר",
+        "מודיעין - ליגד סנטר",
+    ],
+    "תל אביב": [
+        "תל אביב - עבר הירקון",
+        "תל אביב - מרכז העיר",
+        "תל אביב - מזרח",
+        "תל אביב - דרום העיר ויפו",
+    ],
+    "ירושלים": ["ירושלים"],
+    "חיפה": ["חיפה"],
+    "באר שבע": ["באר שבע"],
+    "ראשון לציון": [
+        "ראשון לציון - מזרח",
+        "ראשון לציון - מערב",
+    ],
+    "רמת גן": [
+        "רמת גן - מזרח",
+        "רמת גן - מערב",
+    ],
+    "אשדוד": [
+        "אשדוד",
+        "אשדוד - איזור תעשייה צפוני",
+    ],
+    "קריית שמונה": ["קריית שמונה"],
+    "נהריה": ["נהריה"],
+}
 
 USERS_FILE = Path(__file__).parent / "users.json"
 
@@ -97,11 +123,23 @@ WAITING_FOR_CITY: set[int] = set()  # chat_ids that sent "Other"
 
 
 def city_keyboard() -> InlineKeyboardMarkup:
+    """First-level keyboard: choose a city group."""
     buttons = [
-        [InlineKeyboardButton(city, callback_data=f"city:{city}")]
-        for city in PRESET_CITIES
+        [InlineKeyboardButton(city, callback_data=f"citygroup:{city}")]
+        for city in CITY_AREAS
     ]
-    buttons.append([InlineKeyboardButton("אחר / Other — הקלד שם עיר", callback_data="city:other")])
+    buttons.append([InlineKeyboardButton("אחר / Other — הקלד שם אזור", callback_data="city:other")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def area_keyboard(city_group: str) -> InlineKeyboardMarkup:
+    """Second-level keyboard: choose a specific area within a city."""
+    areas = CITY_AREAS[city_group]
+    buttons = [
+        [InlineKeyboardButton(area, callback_data=f"area:{area}")]
+        for area in areas
+    ]
+    buttons.append([InlineKeyboardButton("אחר / Other — הקלד שם אזור", callback_data="city:other")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -124,29 +162,51 @@ async def cmd_city(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def handle_city_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _register_area(query, chat_id: str, area: str) -> None:
+    """Persist the area and confirm to the user."""
+    users = load_users()
+    users[chat_id] = area
+    save_users(users)
+    await query.edit_message_text(
+        f"✅ נרשמת לקבלת התרעות עבור: {area}\n"
+        f"You will receive alerts for: {area}\n\n"
+        "כדי לשנות אזור, שלח /city"
+    )
+    logger.info("User %s registered for area: %s", chat_id, area)
+
+
+async def handle_citygroup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """First-level selection: city group chosen."""
     query = update.callback_query
     await query.answer()
 
-    chat_id = str(query.message.chat_id)
-    data = query.data  # "city:<name>" or "city:other"
+    city_group = query.data.removeprefix("citygroup:")
+    areas = CITY_AREAS.get(city_group, [])
 
-    if data == "city:other":
-        WAITING_FOR_CITY.add(query.message.chat_id)
-        await query.edit_message_text("הקלד את שם העיר בעברית:\nType the city name in Hebrew:")
-        return
+    if len(areas) == 1:
+        # Only one area — register immediately without a second keyboard
+        await _register_area(query, str(query.message.chat_id), areas[0])
+    else:
+        await query.edit_message_text(
+            f"בחר אזור ב{city_group} / Choose an area in {city_group}:",
+            reply_markup=area_keyboard(city_group),
+        )
 
-    city = data.removeprefix("city:")
-    users = load_users()
-    users[chat_id] = city
-    save_users(users)
 
-    await query.edit_message_text(
-        f"✅ נרשמת לקבלת התרעות עבור: {city}\n"
-        f"You will receive alerts for: {city}\n\n"
-        "כדי לשנות עיר, שלח /city"
-    )
-    logger.info("User %s registered for city: %s", chat_id, city)
+async def handle_area_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Second-level selection: specific area chosen."""
+    query = update.callback_query
+    await query.answer()
+    area = query.data.removeprefix("area:")
+    await _register_area(query, str(query.message.chat_id), area)
+
+
+async def handle_other_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """User chose 'Other' — prompt free-text entry."""
+    query = update.callback_query
+    await query.answer()
+    WAITING_FOR_CITY.add(query.message.chat_id)
+    await query.edit_message_text("הקלד את שם האזור בעברית:\nType the area name in Hebrew:")
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -280,10 +340,16 @@ async def main() -> None:
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("city", cmd_city))
-    app.add_handler(CallbackQueryHandler(handle_city_callback, pattern=r"^city:"))
+    app.add_handler(CallbackQueryHandler(handle_citygroup_callback, pattern=r"^citygroup:"))
+    app.add_handler(CallbackQueryHandler(handle_area_callback, pattern=r"^area:"))
+    app.add_handler(CallbackQueryHandler(handle_other_callback, pattern=r"^city:other$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     await app.initialize()
+    await app.bot.set_my_commands([
+        ("start", "Register / choose your alert area"),
+        ("city", "Change your registered area"),
+    ])
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
 

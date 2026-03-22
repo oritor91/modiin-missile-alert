@@ -253,22 +253,43 @@ async def fetch_alerts(session: aiohttp.ClientSession) -> dict | None:
         return None
 
 
-def get_alerted_cities(alert_data: dict) -> set[str]:
-    """Return the set of targeted cities for missile/rocket alerts (cat=1)."""
-    if str(alert_data.get("cat", "")) != "1":
-        return set()
-    return {city.strip() for city in alert_data.get("data", []) if city.strip()}
+ALERT_CATEGORIES = {
+    "1": "rocket",    # ירי רקטות וטילים  — standard red alert
+    "14": "early",    # בדקות הקרובות צפויות להתקבל התרעות באזורך  — early warning
+}
 
 
-def format_alert_message(city: str, alert_data: dict) -> str:
-    title = alert_data.get("title", "ירי טילים ורקטות")
+def get_alerted_cities(alert_data: dict) -> tuple[set[str], str]:
+    """Return (targeted cities, alert_type) for actionable alert categories.
+
+    alert_type is "rocket" for cat=1, "early" for cat=14, or "" if ignored.
+    """
+    cat = str(alert_data.get("cat", ""))
+    alert_type = ALERT_CATEGORIES.get(cat, "")
+    if not alert_type:
+        return set(), ""
+    cities = {city.strip() for city in alert_data.get("data", []) if city.strip()}
+    return cities, alert_type
+
+
+def format_alert_message(city: str, alert_data: dict, alert_type: str) -> str:
     desc = alert_data.get("desc", "היכנסו למרחב המוגן")
+    if alert_type == "early":
+        return (
+            f"⚠️ אזהרה מוקדמת: בדקות הקרובות צפויות התרעות באזורך\n"
+            f"📍 אזור: {city}\n"
+            f"⚠️ הנחיה: {desc}\n\n"
+            f"⚠️ EARLY WARNING: Alerts expected in your area soon\n"
+            f"📍 Area: {city}\n"
+            f"⚠️ Action: {desc}"
+        )
+    title = alert_data.get("title", "ירי טילים ורקטות")
     return (
         f"🚨 התרעה: {title}\n"
-        f"📍 עיר: {city}\n"
+        f"📍 אזור: {city}\n"
         f"⚠️ הנחיה: {desc}\n\n"
         f"🚨 ALERT: Missile/Rocket fire\n"
-        f"📍 City: {city}\n"
+        f"📍 Area: {city}\n"
         f"⚠️ Action: Enter the protected space immediately."
     )
 
@@ -296,7 +317,7 @@ async def poll_loop(application: Application) -> None:
                     continue
 
                 alert_id = str(alert_data.get("id", "")) or str(alert_data.get("data", ""))
-                alerted_cities = get_alerted_cities(alert_data)
+                alerted_cities, alert_type = get_alerted_cities(alert_data)
 
                 if not alerted_cities:
                     await asyncio.sleep(POLL_INTERVAL)
@@ -309,7 +330,7 @@ async def poll_loop(application: Application) -> None:
                     if _sent_alerts.get(chat_id) == alert_id:
                         continue  # already sent this alert to this user
 
-                    message = format_alert_message(city, alert_data)
+                    message = format_alert_message(city, alert_data, alert_type)
                     try:
                         await application.bot.send_message(chat_id=int(chat_id), text=message)
                         _sent_alerts[chat_id] = alert_id

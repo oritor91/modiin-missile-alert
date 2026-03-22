@@ -2,11 +2,10 @@
 Missile alert Telegram bot.
 
 Polls the oref.org.il REST API for active rocket/missile alerts and notifies
-registered users when their chosen city is targeted.
+registered users when their chosen area is targeted.
 
-Users register via /start or /city and pick a city from an inline keyboard.
-City selection is two-step: first pick a city, then pick a zone within it
-(or choose "All zones").
+Users register via /start or /city: first pick a city group, then pick the
+specific area within that city (matching the exact strings the oref API uses).
 """
 
 import asyncio
@@ -44,21 +43,45 @@ LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 # ---------------------------------------------------------------------------
 
 OREF_API_URL = "https://www.oref.org.il/WarningMessages/alert/alerts.json"
-OREF_CITIES_URL = "https://www.oref.org.il/Shared/Ajax/GetCitiesMix.aspx?lang=he"
 OREF_HEADERS = {
     "Referer": "https://www.oref.org.il/",
     "X-Requested-With": "XMLHttpRequest",
 }
 
-# Preset cities shown on the inline keyboard
-PRESET_CITIES = [
-    "מודיעין-מכבים-רעות",
-    "תל אביב - יפו",
-    "ירושלים",
-    "חיפה",
-    "באר שבע",
-    "ראשון לציון",
-]
+# Two-level city → area mapping.
+# Keys are displayed on the first keyboard; values are the exact area strings
+# that oref.org.il uses in its alert payload. Cities with a single entry skip
+# the second keyboard and register directly.
+CITY_AREAS: dict[str, list[str]] = {
+    "מודיעין": [
+        "מודיעין מכבים רעות",
+        "מודיעין - ישפרו סנטר",
+        "מודיעין - ליגד סנטר",
+    ],
+    "תל אביב": [
+        "תל אביב - עבר הירקון",
+        "תל אביב - מרכז העיר",
+        "תל אביב - מזרח",
+        "תל אביב - דרום העיר ויפו",
+    ],
+    "ירושלים": ["ירושלים"],
+    "חיפה": ["חיפה"],
+    "באר שבע": ["באר שבע"],
+    "ראשון לציון": [
+        "ראשון לציון - מזרח",
+        "ראשון לציון - מערב",
+    ],
+    "רמת גן": [
+        "רמת גן - מזרח",
+        "רמת גן - מערב",
+    ],
+    "אשדוד": [
+        "אשדוד",
+        "אשדוד - איזור תעשייה צפוני",
+    ],
+    "קריית שמונה": ["קריית שמונה"],
+    "נהריה": ["נהריה"],
+}
 
 USERS_FILE = Path(__file__).parent / "users.json"
 
@@ -73,7 +96,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# User storage  {str(chat_id): city_or_zone_name}
+# User storage  {str(chat_id): city_name}
 # ---------------------------------------------------------------------------
 
 
@@ -93,14 +116,8 @@ def save_users(users: dict[str, str]) -> None:
         logger.error("Failed to save users.json: %s", e)
 
 
-def register_user(chat_id: str, location: str) -> None:
-    users = load_users()
-    users[chat_id] = location
-    save_users(users)
-
-
 # ---------------------------------------------------------------------------
-# City / zone helpers
+# City selection helpers
 # ---------------------------------------------------------------------------
 
 WAITING_FOR_CITY: set[int] = set()  # chat_ids that sent "Other"
@@ -112,14 +129,7 @@ def normalize(text: str) -> str:
 
 
 def city_matches_alert(user_location: str, alerted_cities: set[str]) -> bool:
-    """Return True if the user's registered location should receive this alert.
-
-    Supports two registration types:
-    - Whole city (e.g. "מודיעין-מכבים-רעות"): matches any zone of that city.
-    - Specific zone (e.g. "מודיעין-מכבים-רעות - אזור א'"): exact match only.
-
-    oref uses " - " as the separator between city and zone name.
-    """
+    """Return True if the user's registered location should receive this alert."""
     norm = normalize(user_location)
     for alerted in alerted_cities:
         if alerted == norm:
@@ -131,53 +141,24 @@ def city_matches_alert(user_location: str, alerted_cities: set[str]) -> bool:
 
 
 def city_keyboard() -> InlineKeyboardMarkup:
+    """First-level keyboard: choose a city group."""
     buttons = [
-        [InlineKeyboardButton(city, callback_data=f"city:{city}")]
-        for city in PRESET_CITIES
+        [InlineKeyboardButton(city, callback_data=f"citygroup:{city}")]
+        for city in CITY_AREAS
     ]
-    buttons.append([InlineKeyboardButton("אחר / Other — הקלד שם עיר", callback_data="city:other")])
+    buttons.append([InlineKeyboardButton("אחר / Other — הקלד שם אזור", callback_data="city:other")])
     return InlineKeyboardMarkup(buttons)
 
 
-def zone_keyboard(zones: list[str]) -> InlineKeyboardMarkup:
-    """Build a keyboard with one button per zone.
-
-    Callback data uses indices to stay well within Telegram's 64-byte limit.
-    """
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(zone, callback_data=f"zone:{i}")]
-        for i, zone in enumerate(zones)
-    ])
-
-
-async def fetch_city_zones(city: str) -> list[str]:
-    """Return a sorted list of zones for *city* from the oref cities API.
-
-    Returns an empty list on any error (caller falls back to whole-city registration).
-    """
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                OREF_CITIES_URL,
-                headers=OREF_HEADERS,
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                if resp.status != 200:
-                    logger.warning("oref cities API returned HTTP %s", resp.status)
-                    return []
-                text = await resp.text(encoding="utf-8-sig")
-                data = json.loads(text.strip())
-                norm_city = normalize(city)
-                zones = sorted({
-                    normalize(item["label"])
-                    for item in data
-                    if isinstance(item.get("label"), str)
-                    and normalize(item["label"]).startswith(norm_city + " - ")
-                })
-                return zones
-    except Exception as e:
-        logger.warning("Failed to fetch city zones for '%s': %s", city, e)
-        return []
+def area_keyboard(city_group: str) -> InlineKeyboardMarkup:
+    """Second-level keyboard: choose a specific area within a city."""
+    areas = CITY_AREAS[city_group]
+    buttons = [
+        [InlineKeyboardButton(area, callback_data=f"area:{area}")]
+        for area in areas
+    ]
+    buttons.append([InlineKeyboardButton("אחר / Other — הקלד שם אזור", callback_data="city:other")])
+    return InlineKeyboardMarkup(buttons)
 
 
 # ---------------------------------------------------------------------------
@@ -199,64 +180,51 @@ async def cmd_city(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def handle_city_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-
-    chat_id = str(query.message.chat_id)
-    data = query.data  # "city:<name>" or "city:other"
-
-    if data == "city:other":
-        WAITING_FOR_CITY.add(query.message.chat_id)
-        await query.edit_message_text("הקלד את שם העיר בעברית:\nType the city name in Hebrew:")
-        return
-
-    city = data.removeprefix("city:")
-
-    # Try to fetch zones for this city so the user can pick one.
-    zones = await fetch_city_zones(city)
-
-    if zones:
-        # Store zone list in chat_data so handle_zone_callback can look them up.
-        context.chat_data["pending_zones"] = zones
-        await query.edit_message_text(
-            f"בחר אזור ב-{city}:\nChoose a zone in {city}:",
-            reply_markup=zone_keyboard(zones),
-        )
-    else:
-        # No sub-zones found — register for the whole city.
-        register_user(chat_id, city)
-        await query.edit_message_text(
-            f"✅ נרשמת לקבלת התרעות עבור: {city}\n"
-            f"You will receive alerts for: {city}\n\n"
-            "כדי לשנות עיר, שלח /city"
-        )
-        logger.info("User %s registered for city: %s", chat_id, city)
-
-
-async def handle_zone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-
-    chat_id = str(query.message.chat_id)
-    zones: list[str] = context.chat_data.get("pending_zones", [])
-
-    try:
-        idx = int(query.data.removeprefix("zone:"))
-        location = zones[idx]
-    except (ValueError, IndexError):
-        await query.edit_message_text("שגיאה — נסה שוב / Error — please try again.")
-        return
-
-    register_user(chat_id, location)
-    context.chat_data.pop("pending_zones", None)
-
+async def _register_area(query, chat_id: str, area: str) -> None:
+    """Persist the area and confirm to the user."""
+    users = load_users()
+    users[chat_id] = area
+    save_users(users)
     await query.edit_message_text(
-        f"✅ נרשמת לקבלת התרעות עבור: {location}\n"
-        f"You will receive alerts for: {location}\n\n"
-        "כדי לשנות עיר/אזור, שלח /city"
+        f"✅ נרשמת לקבלת התרעות עבור: {area}\n"
+        f"You will receive alerts for: {area}\n\n"
+        "כדי לשנות אזור, שלח /city"
     )
-    logger.info("User %s registered for location: %s", chat_id, location)
+    logger.info("User %s registered for area: %s", chat_id, area)
+
+
+async def handle_citygroup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """First-level selection: city group chosen."""
+    query = update.callback_query
+    await query.answer()
+
+    city_group = query.data.removeprefix("citygroup:")
+    areas = CITY_AREAS.get(city_group, [])
+
+    if len(areas) == 1:
+        # Only one area — register immediately without a second keyboard
+        await _register_area(query, str(query.message.chat_id), areas[0])
+    else:
+        await query.edit_message_text(
+            f"בחר אזור ב{city_group} / Choose an area in {city_group}:",
+            reply_markup=area_keyboard(city_group),
+        )
+
+
+async def handle_area_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Second-level selection: specific area chosen."""
+    query = update.callback_query
+    await query.answer()
+    area = query.data.removeprefix("area:")
+    await _register_area(query, str(query.message.chat_id), area)
+
+
+async def handle_other_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """User chose 'Other' — prompt free-text entry."""
+    query = update.callback_query
+    await query.answer()
+    WAITING_FOR_CITY.add(query.message.chat_id)
+    await query.edit_message_text("הקלד את שם האזור בעברית:\nType the area name in Hebrew:")
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -267,7 +235,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     city = update.message.text.strip()
     WAITING_FOR_CITY.discard(chat_id)
 
-    register_user(str(chat_id), city)
+    users = load_users()
+    users[str(chat_id)] = city
+    save_users(users)
 
     await update.message.reply_text(
         f"✅ נרשמת לקבלת התרעות עבור: {city}\n"
@@ -403,11 +373,16 @@ async def main() -> None:
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("city", cmd_city))
-    app.add_handler(CallbackQueryHandler(handle_city_callback, pattern=r"^city:"))
-    app.add_handler(CallbackQueryHandler(handle_zone_callback, pattern=r"^zone:"))
+    app.add_handler(CallbackQueryHandler(handle_citygroup_callback, pattern=r"^citygroup:"))
+    app.add_handler(CallbackQueryHandler(handle_area_callback, pattern=r"^area:"))
+    app.add_handler(CallbackQueryHandler(handle_other_callback, pattern=r"^city:other$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     await app.initialize()
+    await app.bot.set_my_commands([
+        ("start", "Register / choose your alert area"),
+        ("city", "Change your registered area"),
+    ])
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
 

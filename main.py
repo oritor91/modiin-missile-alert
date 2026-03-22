@@ -290,13 +290,22 @@ def get_alerted_cities(alert_data: dict) -> set[str]:
 def format_alert_message(location: str, alert_data: dict) -> str:
     title = alert_data.get("title", "ירי טילים ורקטות")
     desc = alert_data.get("desc", "היכנסו למרחב המוגן")
+    cat = str(alert_data.get("cat", "1"))
+
+    if cat == "14":
+        emoji = "⚠️"
+        en_title = "Early warning (pre-alert)"
+    else:
+        emoji = "🚨"
+        en_title = title
+
     return (
-        f"🚨 התרעה: {title}\n"
+        f"{emoji} התרעה: {title}\n"
         f"📍 אזור: {location}\n"
         f"⚠️ הנחיה: {desc}\n\n"
-        f"🚨 ALERT: Missile/Rocket fire\n"
+        f"{emoji} ALERT: {en_title}\n"
         f"📍 Area: {location}\n"
-        f"⚠️ Action: Enter the protected space immediately."
+        f"⚠️ Action: {desc}"
     )
 
 

@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import sys
+import time
 import unicodedata
 from pathlib import Path
 
@@ -47,6 +48,9 @@ OREF_HEADERS = {
     "Referer": "https://www.oref.org.il/",
     "X-Requested-With": "XMLHttpRequest",
 }
+
+TZOFAR_WS_URL = "wss://ws.tzevaadom.co.il/socket?platform=ANDROID"
+EARLY_WARNING_COOLDOWN = 1800  # seconds — suppress duplicate early warnings within 30 min
 
 # Two-level city → area mapping.
 # Keys are displayed on the first keyboard; values are the exact area strings
@@ -316,6 +320,9 @@ def format_alert_message(location: str, alert_data: dict) -> str:
 # {chat_id_str: last_alert_id_sent}
 _sent_alerts: dict[str, str | None] = {}
 
+# Monotonic timestamp of the last early-warning broadcast (0 = never sent)
+_early_warning_sent_at: float = 0.0
+
 
 async def poll_loop(application: Application) -> None:
     logger.info("Starting alert poll loop (interval=%ss)", POLL_INTERVAL)
@@ -366,6 +373,68 @@ async def poll_loop(application: Application) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Tzofar WebSocket — early-warning source
+# ---------------------------------------------------------------------------
+
+
+async def tzofar_ws_loop(application: Application) -> None:
+    """Connect to Tzofar WebSocket and forward SYSTEM_MESSAGE early warnings."""
+    global _early_warning_sent_at
+    backoff = 2
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                logger.info("Connecting to Tzofar WebSocket...")
+                async with session.ws_connect(TZOFAR_WS_URL) as ws:
+                    logger.info("Connected to Tzofar WebSocket")
+                    backoff = 2  # reset on successful connect
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            try:
+                                data = json.loads(msg.data)
+                            except json.JSONDecodeError:
+                                continue
+                            msg_type = data.get("type", "")
+                            if msg_type != "SYSTEM_MESSAGE":
+                                continue
+
+                            text = data.get("data") or data.get("message") or ""
+                            logger.info("Tzofar SYSTEM_MESSAGE: %s", text)
+
+                            # Dedup: one early-warning broadcast per cooldown window
+                            now = time.monotonic()
+                            if now - _early_warning_sent_at < EARLY_WARNING_COOLDOWN:
+                                logger.debug("Early warning suppressed (cooldown)")
+                                continue
+                            _early_warning_sent_at = now
+
+                            message = (
+                                f"⚠️ הנחיה מקדימה: {text}\n\n"
+                                f"⚠️ Early warning: Alerts may be activated in the coming minutes.\n"
+                                f"Stay near a shelter."
+                            )
+                            users = load_users()
+                            for chat_id in users:
+                                try:
+                                    await application.bot.send_message(
+                                        chat_id=int(chat_id), text=message
+                                    )
+                                    logger.info("Early warning sent to user %s", chat_id)
+                                except Exception as e:
+                                    logger.error("Failed to send early warning to %s: %s", chat_id, e)
+
+                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            logger.warning("Tzofar WebSocket closed/error")
+                            break
+
+        except Exception as e:
+            logger.warning("Tzofar WebSocket error: %s. Reconnecting in %ss", e, backoff)
+
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 60)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -398,7 +467,7 @@ async def main() -> None:
     logger.info("Bot started. Polling for updates and alerts.")
 
     try:
-        await poll_loop(app)
+        await asyncio.gather(poll_loop(app), tzofar_ws_loop(app))
     except (KeyboardInterrupt, asyncio.CancelledError):
         logger.info("Shutting down...")
     finally:
